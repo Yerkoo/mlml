@@ -1,90 +1,108 @@
-# Fine-tuning языковой модели под дружелюбный стиль ответов
+# Fine-tuning an LLM for a Friendly Conversational Style
 
-Проект выполнен по ТЗ: полный цикл дообучения LLM — от данных до оценки.
-Модель: `mistralai/Mistral-7B-Instruct-v0.3`. Метод: LoRA. Среда: Google Colab (GPU T4).
+This was my assignment for an ML Engineering internship application: take a language
+model through the full fine-tuning cycle — data, training, evaluation — and actually
+understand every step, not just run someone else's script.
 
-## Структура репозитория
+I'd never done this before, so this repo is also honestly a record of me learning LoRA
+fine-tuning from scratch on a free Google Colab GPU, hitting real errors (bitsandbytes
+version conflicts, GPU quota running out mid-generation), and working through them.
+
+**Model:** `mistralai/Mistral-7B-Instruct-v0.3` · **Method:** LoRA · **Environment:** Google Colab (T4 GPU, free tier)
+
+## What's in this repo
 
 ```
 .
-├── README.md                          # этот файл
-├── dataset.jsonl                      # финальный датасет (Шаг 1)
-├── generate_dataset.py                # скрипт генерации датасета
-├── lora-adapter-friendly-style.zip    # обученный LoRA-адаптер (Шаг 2)
-├── loss_curve.png                     # график обучения (Шаг 2)
-└── (ноутбуки Colab для шагов 1–3)
+├── README.md                          # this file
+├── dataset.jsonl                      # final dataset (Step 1)
+├── generate_dataset.py                # dataset generation script
+├── lora-adapter-friendly-style.zip    # trained LoRA adapter (Step 2)
+├── loss_curve.png                     # training loss chart (Step 2)
+└── (Colab notebooks for steps 1–3)
 ```
 
-## Итог по требованиям ТЗ
+## Task checklist
 
-| Шаг | Требование | Статус |
+| Step | Requirement | Status |
 |---|---|---|
-| 1. Данные | ≥200 примеров, JSONL, дедуп, фильтрация | ✅ 350 примеров |
-| 2. Fine-tuning | LoRA/QLoRA, PEFT+Transformers, loss curve, только адаптер | ✅ |
-| 3. Оценка | 10–20 примеров, метрика, выводы | ✅ 11 примеров, ROUGE-L |
+| 1. Data | ≥200 examples, JSONL, dedup, quality filtering | ✅ 350 examples |
+| 2. Fine-tuning | LoRA/QLoRA, PEFT+Transformers, loss curve, adapter-only save | ✅ |
+| 3. Evaluation | 10–20 examples, at least one metric, conclusions | ✅ 11 examples, ROUGE-L |
 
 ---
 
-## Шаг 1 — Данные
+## Step 1 — Data
 
-### Цель
-Собрать датасет instruction-response (минимум 200 примеров) для дообучения модели
-под дружелюбный/разговорный стиль ответов.
+### Goal
+Build an instruction-response dataset (minimum 200 examples) to later fine-tune a
+model toward a warm, friendly, conversational tone.
 
-### Модель и датасет
-- **Модель для синтеза:** `mistralai/Mistral-7B-Instruct-v0.3`, загружена в 4-bit
-  (bitsandbytes/NF4) для запуска на бесплатном Google Colab (GPU T4, 16GB VRAM).
-- **Источник инструкций (seed dataset):** `tatsu-lab/alpaca` с HuggingFace (52 002
-  примера). Отобраны записи с пустым полем `input`, взята выборка из 350 инструкций.
-- **Язык:** английский — упрощает пайплайн и лучше соответствует данным, на которых
-  в основном обучен Mistral.
+### Model and dataset
+- **Model used to synthesize data:** `mistralai/Mistral-7B-Instruct-v0.3`, loaded in
+  4-bit (bitsandbytes/NF4) so it fits on a free Colab T4 GPU (16GB VRAM).
+- **Seed dataset:** `tatsu-lab/alpaca` from HuggingFace (52,002 examples). I filtered
+  down to entries with an empty `input` field (self-contained instructions), then took
+  a sample of 350.
+- **Language:** English — a deliberate choice. The task didn't actually require Russian
+  specifically (I'd assumed it did at first), and English keeps the pipeline simpler
+  and plays to Mistral's strengths, since it's trained mostly on English text.
 
-### Метод синтеза
-Инструкции прогонялись через Mistral-7B-Instruct с системным промптом:
+### How the data was generated
+I ran each instruction through Mistral-7B-Instruct with a system prompt asking it to
+answer in a specific style:
 
 > "You are a warm, friendly conversational assistant. Answer casually and kindly,
 > like you're talking to a good friend. Keep it natural, avoid overly formal or
 > robotic language."
 
-Получены пары `(instruction, response)`, где `response` — новый ответ модели в целевом
-стиле (а не оригинальный сухой ответ из alpaca). Это соответствует формулировке ТЗ:
-«используя публично доступную модель ... собери или синтезируй датасет».
+So each pair is `(instruction, response)`, where the response is a *new* answer from
+the model in the target style — not the original, drier alpaca answer. This matches
+what the assignment asked for: "using a publicly available model... collect or
+synthesize a dataset."
 
-Генерация сохранялась построчно (`f.flush()` после каждого примера) для защиты от
-потери прогресса при обрыве сессии Colab.
+Every example was flushed to disk right after generation, so a dropped Colab session
+wouldn't wipe out hours of progress (which, spoiler, mattered more than once).
 
-### Очистка и фильтрация
-1. **Дедупликация** — по MD5-хешу нормализованного текста инструкции. Исходные 350
-   инструкций уже были уникальны в alpaca → дублей не найдено (350 → 350).
-2. **Фильтр качества** — длина ответа 20–2000 символов, отсутствие фраз-отказов
-   ("as an AI", "as a digital assistant" и т.п.), проверка на зацикливание.
-   Все 350 примеров прошли фильтр (350 → 350).
+### Cleaning and filtering
+1. **Deduplication** — MD5 hash of the normalized instruction text. Since the 350
+   source instructions were already unique in alpaca, nothing was actually duplicated
+   (350 → 350).
+2. **Quality filter** — response length between 20 and 2000 characters, no obvious
+   refusal/out-of-character phrases ("as an AI", "as a digital assistant", etc.), and
+   a basic repetition check. All 350 examples passed (350 → 350) — a good sign the
+   system prompt was well-tuned.
 
-### Итог
-- 350 пар instruction-response, формат `dataset.jsonl`
-- Требование ТЗ (минимум 200, JSONL, дедуп, фильтрация) выполнено с запасом
+### Result
+350 instruction-response pairs in `dataset.jsonl` — comfortably above the 200 minimum.
 
 ---
 
-## Шаг 2 — Fine-tuning (LoRA)
+## Step 2 — Fine-tuning (LoRA)
 
-### Цель
-Дообучить Mistral-7B-Instruct методом LoRA на `dataset.jsonl`, чтобы модель сама,
-без стилевого промпта, отвечала дружелюбно.
+### Goal
+Fine-tune Mistral-7B-Instruct with LoRA on `dataset.jsonl` so the model adopts the
+friendly style on its own, with no prompt needed.
 
-### Окружение
-Google Colab (GPU T4), `transformers==4.44.2`, `accelerate==0.33.0`, `peft==0.11.1`,
-`bitsandbytes==0.43.1`. Модель в 4-bit (NF4).
+### Environment
+Google Colab (T4 GPU), `transformers==4.44.2`, `accelerate==0.33.0`, `peft==0.11.1`,
+`bitsandbytes==0.43.1`. Model loaded in 4-bit (NF4).
 
-### Подготовка данных
-Пары приведены к chat-формату Mistral (`<s>[INST] instruction [/INST] response</s>`)
-через `apply_chat_template`, токенизированы с `max_length=512`. `labels` формируются
-коллатором (`DataCollatorForLanguageModeling`, `mlm=False`) после паддинга батча —
-не вручную, чтобы избежать несовпадения длин тензоров.
+One real hiccup worth mentioning: `bitsandbytes` threw an internal kernel-registration
+error partway through (`RuntimeError: already a kernel registered...`). A plain
+"Restart runtime" didn't fix it — I had to fully disconnect and delete the runtime,
+then reinstall pinned, known-compatible versions. Worth knowing if you hit the same wall.
 
-### LoRA-конфигурация
+### Data formatting
+Each pair was converted into Mistral's chat format (`<s>[INST] instruction [/INST]
+response</s>`) via `apply_chat_template`, then tokenized with `max_length=512`.
+`labels` are created by the data collator (`DataCollatorForLanguageModeling`,
+`mlm=False`) *after* batch padding — not copied manually beforehand, which was my
+first attempt and caused a tensor-length mismatch error.
 
-| Параметр | Значение |
+### LoRA configuration
+
+| Parameter | Value |
 |---|---|
 | r (rank) | 16 |
 | lora_alpha | 32 |
@@ -92,84 +110,97 @@ Google Colab (GPU T4), `transformers==4.44.2`, `accelerate==0.33.0`, `peft==0.11
 | lora_dropout | 0.05 |
 | task_type | CAUSAL_LM |
 
-Модель подготовлена через `prepare_model_for_kbit_training` перед оборачиванием LoRA.
+The model was prepped with `prepare_model_for_kbit_training` before wrapping it in
+LoRA.
 
-**Обучаемых параметров: 13 631 488 из 7 261 655 040 (0.19%)**.
+**Trainable parameters: 13,631,488 out of 7,261,655,040 — just 0.19%.** Seeing that
+number was honestly the moment LoRA "clicked" for me — you're really only touching a
+sliver of the model.
 
-### Параметры обучения
+### Training setup
 
-| Параметр | Значение |
+| Parameter | Value |
 |---|---|
-| Эпохи | 3 |
-| Batch size / grad accumulation | 4 / 4 (эффективный батч 16) |
+| Epochs | 3 |
+| Batch size / grad accumulation | 4 / 4 (effective batch 16) |
 | Learning rate | 2e-4 |
 | Precision | fp16 |
 
-### Результаты
-- Время обучения: ~16 минут на T4, 66 шагов
-- **Loss: 1.12 → 0.42** (график — `loss_curve.png`), стабильное снижение без признаков
-  расхождения или переобучения
+### Results
+- Training time: ~16 minutes on T4, 66 steps
+- **Loss: 1.12 → 0.42** (see `loss_curve.png`) — a steady decline with no signs of
+  divergence or overfitting
 
-### Сохранённый артефакт
-Только LoRA-адаптер (~52 МБ), не вся модель (~14 ГБ) — требование ТЗ выполнено.
+### Saved artifact
+Only the LoRA adapter was saved (~52 MB), not the full model (~14 GB) — as required.
 
 ---
 
-## Шаг 3 — Оценка
+## Step 3 — Evaluation
 
-### Цель
-Сравнить базовую и дообученную модель на новых примерах, оценить перенос стиля и
-сохранность содержания.
+### Goal
+Compare the base model against the fine-tuned one on unseen examples: did the style
+actually transfer, and did the model keep answering correctly along the way?
 
-### Тестовый набор
-15 инструкций из alpaca (индексы 350–365), не использованных при обучении. Из-за
-обрыва GPU-сессии Colab (лимит бесплатного тарифа) итоговое сравнение сделано на
-**11 парах** ответов — укладывается в требование ТЗ (10–20 примеров).
+### Test set
+15 instructions from alpaca (indices 350–365) that were never used in training. Colab's
+free GPU quota ran out mid-generation, so the final comparison uses **11 complete
+pairs** instead of 15 — still within the assignment's 10–20 range.
 
-### Метод
-- Базовая модель: тот же чекпоинт с `model.disable_adapter()`, без стилевого промпта.
-- Дообученная модель: тот же чекпоинт с активным LoRA-адаптером.
-- Генерация без сэмплирования (`do_sample=False`) для воспроизводимости.
-- Метрика: **ROUGE-L** относительно оригинального ответа из alpaca (проверка
-  сохранности содержания, а не стиля).
+### Method
+- **Base model:** the same checkpoint with `model.disable_adapter()`, no style prompt.
+- **Fine-tuned model:** the same checkpoint with the LoRA adapter active.
+- Generation with `do_sample=False` for a reproducible, apples-to-apples comparison.
+- **Metric: ROUGE-L** against the original alpaca answer — this checks that content
+  was preserved, not style.
 
-### Результаты
+### Results
 
-| Модель | Средний ROUGE-L |
+| Model | Average ROUGE-L |
 |---|---|
-| Базовая (без адаптера) | 0.2273 |
-| Дообученная (с LoRA) | 0.2003 |
+| Base (no adapter) | 0.2273 |
+| Fine-tuned (LoRA) | 0.2003 |
 
-### Качественное сравнение
-Базовая модель отвечает формально, почти сразу переходит к нумерованному списку, без
-обращения к пользователю. Дообученная модель систематически открывает ответ дружелюбным
-обращением ("Hey there!", "Absolutely!"), использует более разговорные обороты и
-метафоры (например, сравнивает роль проект-менеджера с дирижёром оркестра), сохраняя
-при этом ту же структуру и факты.
+### Qualitative comparison
+The base model answers formally and drops straight into a numbered list, no greeting,
+no warmth. The fine-tuned model consistently opens with something friendly ("Hey
+there!", "Absolutely!"), leans on casual phrasing and metaphors (comparing a project
+manager to an orchestra conductor, SEO to a lighthouse), while keeping the same
+underlying structure and facts.
 
-Пример (вопрос "Describe the role of a project manager"):
-- База: *"A Project Manager (PM) plays a crucial role in ensuring the successful
+Example (prompt: "Describe the role of a project manager"):
+- Base: *"A Project Manager (PM) plays a crucial role in ensuring the successful
   completion of a project..."*
-- Дообученная: *"Hey there! So, a project manager is like the conductor of an
+- Fine-tuned: *"Hey there! So, a project manager is like the conductor of an
   orchestra, but instead of music, they're orchestrating a team..."*
 
-### Выводы
-- **Стало лучше** относительно цели задания: модель стабильно переняла дружелюбный
-  стиль без необходимости в промпте — дообучение сработало.
-- Небольшое снижение ROUGE-L (0.227 → 0.200) — ожидаемый компромисс: часть "текстового
-  бюджета" уходит на стилевые элементы вместо точного повторения формулировок
-  оригинала. Падение небольшое, содержание и структура ответов сохранены.
-- Ограничения оценки: выборка из 11 примеров (из-за обрыва сессии) и одна метрика
-  (ROUGE-L измеряет лексическое, а не смысловое пересечение). В дальнейшем стоило бы
-  добавить BERTScore и/или LLM-as-a-judge с явной шкалой "дружелюбности".
+### Conclusions
+- **It got better**, in the sense that actually mattered for this task: the model
+  consistently picked up the friendly tone with zero prompting — the fine-tuning did
+  what it was supposed to do.
+- The small ROUGE-L drop (0.227 → 0.200) is an expected, acceptable trade-off — some
+  of the response now goes toward greetings and stylistic flourishes instead of
+  mirroring the original wording exactly. The drop is modest, and the underlying
+  content and structure are clearly still there.
+- Honest limitations: only 11 examples (due to the session dropping), and a single
+  metric that measures lexical overlap, not meaning. A stronger evaluation would add
+  BERTScore for semantic similarity and/or an LLM-as-a-judge score specifically for
+  "how friendly does this sound," rather than relying on content-preservation alone.
 
 ---
 
-## Как воспроизвести полностью
-1. **Данные:** Colab + GPU T4 → HuggingFace login → загрузить `tatsu-lab/alpaca` →
-   загрузить Mistral-7B-Instruct в 4-bit → сгенерировать ответы со стилевым промптом →
-   дедуп + фильтрация → сохранить `dataset.jsonl`.
-2. **Обучение:** загрузить `dataset.jsonl` → подготовить chat-формат и токенизацию →
-   настроить `LoraConfig` → обучить через `Trainer` → сохранить адаптер.
-3. **Оценка:** сгенерировать ответы базовой и дообученной модели на новых примерах →
-   посчитать ROUGE-L → сравнить качественно → сформулировать выводы.
+## Reproducing this end to end
+1. **Data:** Colab + T4 GPU → log into HuggingFace → load `tatsu-lab/alpaca` → load
+   Mistral-7B-Instruct in 4-bit → generate responses with the style system prompt →
+   dedupe + filter → save `dataset.jsonl`.
+2. **Training:** load `dataset.jsonl` → format to chat template + tokenize → configure
+   `LoraConfig` → train with `Trainer` → save the adapter.
+3. **Evaluation:** generate answers from both the base and fine-tuned model on new
+   prompts → compute ROUGE-L → compare qualitatively → write up conclusions.
+
+## What I'd do differently with more time
+- Save intermediate results to Google Drive from the start, not local Colab storage —
+  would have avoided losing progress twice to session drops.
+- Add a second metric (BERTScore) to cross-check ROUGE-L, since lexical overlap alone
+  is a pretty blunt way to measure "did the meaning survive."
+- Run the full 15-example eval set instead of 11, GPU quota permitting.
